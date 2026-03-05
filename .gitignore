@@ -1,0 +1,23 @@
+# dependencias
+node_modules/
+
+# logs / runtime
+logs/
+*.log
+
+# env / secrets
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# pm2 (si existe)
+pids/
+.pm2/
+
+# ngrok (si existe)
+ngrok.exe
+ngrok.yml

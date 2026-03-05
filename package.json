@@ -1,0 +1,16 @@
+{
+  "name": "bigcommerce-updates",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "check-orders": "node src/checkOrdersInIdeal.js"
+  },
+  "dependencies": {
+    "@google-cloud/bigquery": "^7.5.0",
+    "axios": "^1.6.0",
+    "dotenv": "^16.6.1",
+    "mysql2": "^3.6.0",
+    "node-firebird": "^1.1.9",
+    "pg": "^8.11.0"
+  }
+}
