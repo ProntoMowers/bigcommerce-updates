@@ -60,6 +60,23 @@ node src/syncLongEtaPreorders.js
 npm run sync-long-eta-preorders
 ```
 
+### 6. Remove Template Association `product-top-seller`
+Busca asociaciones de template custom de Stencil (`product-top-seller`) en BigCommerce,
+las elimina vía `Custom Template Associations` y genera un CSV con los productos modificados por tienda.
+
+```bash
+node src/removeProductTopSellerLayout.js STORE_CODE
+
+# Procesar una tienda
+node src/removeProductTopSellerLayout.js 20
+
+# Procesar todas las tiendas
+node src/removeProductTopSellerLayout.js all
+
+# Usando npm script
+npm run remove-top-seller-layout -- all
+```
+
 ## Instalación
 
 ```bash

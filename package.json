@@ -6,7 +6,9 @@
     "check-orders": "node src/checkOrdersInIdeal.js",
     "update-custom-fields": "node src/updateCustomFieldsInventoryTop.js",
     "sync-long-eta-preorders": "node src/syncLongEtaPreorders.js",
-    "test-config": "node scripts/test-config.js"
+    "test-config": "node scripts/test-config.js",
+    "remove-top-seller-layout": "node src/removeProductTopSellerLayout.js",
+    "debug-layout-file": "node src/debugProductLayoutFile.js"
   },
   "dependencies": {
     "@google-cloud/bigquery": "^7.5.0",

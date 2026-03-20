@@ -3,7 +3,7 @@
 /**
  * Script: updateCustomFieldsInventoryTop.js
  *
- * Sincronización de Custom Fields __inv, __top y __badge en BigCommerce
+ * Sincronización de Custom Fields __inv, __topseller y __badge en BigCommerce
  *
  * USO:
  *    node src/updateCustomFieldsInventoryTop.js STORE_CODE [PRODUCT_ID]
@@ -25,7 +25,7 @@ const logger = createLogger(SCRIPT_NAME);
 
 // Configuración de la API de Parts Availability
 const PARTS_API_URL = process.env.PARTS_API_URL || 'http://10.1.10.21:3001/v1/parts/availability/resolve';
-const PARTS_API_KEY = process.env.PARTS_API_KEY || '';
+const PARTS_API_KEY = process.env.PARTS_API_KEY || process.env.PARTS_AVAILABILITY_API_KEY || '';
 const LOCATION_ID = 4; // Siempre usar locationId = 4
 const BATCH_SIZE = 50; // Máximo de productos por request
 
@@ -40,9 +40,9 @@ const stats = {
   productsWithInventory: 0,
   productsAB: 0,
   productsSpecial: 0,
-  customFieldsCreated: { __inv: 0, __top: 0, __badge: 0 },
-  customFieldsUpdated: { __inv: 0, __top: 0, __badge: 0 },
-  customFieldsDeleted: { __inv: 0, __top: 0, __badge: 0 },
+  customFieldsCreated: { __inv: 0, __topseller: 0, __badge: 0 },
+  customFieldsUpdated: { __inv: 0, __topseller: 0, __badge: 0 },
+  customFieldsDeleted: { __inv: 0, __topseller: 0, __badge: 0 },
   errors: 0,
   startTime: null,
   endTime: null,
@@ -298,11 +298,20 @@ async function getPartsAvailability(storeId, products) {
     
     return response.data.results || [];
   } catch (error) {
+    const status = error.response?.status;
     logger.error(`Error consultando Parts Availability API: ${error.message}`);
     if (error.response?.data) {
       logger.error(`Parts API response body: ${JSON.stringify(error.response.data)}`);
     }
     stats.errors++;
+
+    // Error de autenticación: abortar para evitar cambios incorrectos en custom fields
+    if (status === 401 || status === 403) {
+      throw new Error(
+        `Parts Availability API respondió ${status}. Verifica PARTS_API_KEY/PARTS_AVAILABILITY_API_KEY en .env.`
+      );
+    }
+
     return [];
   }
 }
@@ -313,7 +322,7 @@ async function getPartsAvailability(storeId, products) {
 async function calculateCustomFieldValues(product, partsData, storeId) {
   const values = {
     __inv: null,
-    __top: null,
+    __topseller: null,
     __badge: null,
   };
   
@@ -332,9 +341,9 @@ async function calculateCustomFieldValues(product, partsData, storeId) {
   if (isSpecial) {
     // Productos especiales tienen prioridad
     values.__inv = 'Y';
-    values.__top = 'Y';
+    values.__topseller = 'Y';
     stats.productsSpecial++;
-    logger.info(`Producto ${product.id} (${product.sku}) es especial - forzando __inv y __top`);
+    logger.info(`Producto ${product.id} (${product.sku}) es especial - forzando __inv y __topseller`);
     return values;
   }
   
@@ -354,11 +363,11 @@ async function calculateCustomFieldValues(product, partsData, storeId) {
     stats.productsWithInventory++;
   }
   
-  // 5. __top - basado en clasificación ABC
+  // 5. __topseller - basado en clasificación ABC
   if (mfridIdeal && partNumberIdeal) {
     const abc = await getProductABC(mfridIdeal, partNumberIdeal);
     if (abc && (abc.clasif_completo === 'A' || abc.clasif_completo === 'B')) {
-      values.__top = 'Y';
+      values.__topseller = 'Y';
       stats.productsAB++;
       logger.info(`Producto ${product.id} (${product.sku}) clasificación: ${abc.clasif_completo}`);
     }
@@ -369,7 +378,7 @@ async function calculateCustomFieldValues(product, partsData, storeId) {
 
 async function syncCustomFields(client, product, desiredValues) {
   const currentFields = product.custom_fields || [];
-  const fieldsToSync = ['__inv', '__top', '__badge'];
+  const fieldsToSync = ['__inv', '__topseller', '__badge'];
   
   for (const fieldName of fieldsToSync) {
     const desiredValue = desiredValues[fieldName];
@@ -486,6 +495,16 @@ async function processStore(storeId, productId = null) {
 
 async function main() {
   stats.startTime = new Date();
+
+  if (
+    !PARTS_API_KEY ||
+    PARTS_API_KEY === 'your_secure_api_key_here' ||
+    PARTS_API_KEY === 'tu_api_key'
+  ) {
+    logger.error('PARTS_API_KEY no está configurada correctamente en .env.');
+    logger.error('Define PARTS_API_KEY (o PARTS_AVAILABILITY_API_KEY) con un valor real.');
+    process.exit(1);
+  }
   
   // Validar argumentos
   const args = process.argv.slice(2);
@@ -553,17 +572,17 @@ async function main() {
     logger.info('');
     logger.info('Custom Fields Creados:');
     logger.info(`  __inv: ${stats.customFieldsCreated.__inv}`);
-    logger.info(`  __top: ${stats.customFieldsCreated.__top}`);
+    logger.info(`  __topseller: ${stats.customFieldsCreated.__topseller}`);
     logger.info(`  __badge: ${stats.customFieldsCreated.__badge}`);
     logger.info('');
     logger.info('Custom Fields Actualizados:');
     logger.info(`  __inv: ${stats.customFieldsUpdated.__inv}`);
-    logger.info(`  __top: ${stats.customFieldsUpdated.__top}`);
+    logger.info(`  __topseller: ${stats.customFieldsUpdated.__topseller}`);
     logger.info(`  __badge: ${stats.customFieldsUpdated.__badge}`);
     logger.info('');
     logger.info('Custom Fields Eliminados:');
     logger.info(`  __inv: ${stats.customFieldsDeleted.__inv}`);
-    logger.info(`  __top: ${stats.customFieldsDeleted.__top}`);
+    logger.info(`  __topseller: ${stats.customFieldsDeleted.__topseller}`);
     logger.info(`  __badge: ${stats.customFieldsDeleted.__badge}`);
     logger.info('');
     logger.info(`Errores: ${stats.errors}`);
