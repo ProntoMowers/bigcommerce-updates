@@ -7,10 +7,15 @@ The Parts Availability API allows you to check real-time inventory availability 
 ## Base URL
 
 ```
-Production: http://10.1.10.21:3001
-Development: http://localhost:3001
-Public (ngrok): https://prontoweb-api.ngrok.app
+Production (public): https://prontoweb-api.ngrok.app
+Production (private network): http://10.1.10.21:3001
 ```
+
+> Important: the API route does **not** use `/api` prefix.
+>
+> ✅ Correct: `/v1/parts/availability/resolve`
+>
+> ❌ Incorrect: `/api/v1/parts/availability/resolve`
 
 ## Public Access (ngrok)
 
@@ -24,6 +29,12 @@ Required header:
 
 ```
 x-api-key: your_api_key_here
+```
+
+Optional but recommended header:
+
+```
+Content-Type: application/json
 ```
 
 ---
@@ -53,7 +64,9 @@ Resolve and check inventory availability for one or multiple products.
 
 **Content-Type:** `application/json`
 
-**Full Production URL:** `http://10.1.10.21:3001/v1/parts/availability/resolve`
+**Full Production URL (public):** `https://prontoweb-api.ngrok.app/v1/parts/availability/resolve`
+
+**Full Production URL (private network):** `http://10.1.10.21:3001/v1/parts/availability/resolve`
 
 **Headers:**
 ```http
@@ -71,7 +84,7 @@ x-api-key: your_api_key_here
 |-----------|------|----------|-------------|
 | `storeId` | number | Yes | Store identifier |
 | `locationId` | number | Yes | Location identifier within the store |
-| `products` | array | Yes | Array of products to check (1-50 items) |
+| `products` | array | Yes | Non-empty array of products to check |
 
 ### Product Object
 
@@ -85,14 +98,68 @@ Each product in the `products` array must include:
 
 **Note:** Either `sku` OR `mpn` is required (at least one must be provided).
 
+### Minimum Valid Payload
+
+```json
+{
+  "storeId": 5,
+  "locationId": 4,
+  "products": [
+    {
+      "brand": "BRIGGS & STRATTON",
+      "sku": "BRIGGS 492932S"
+    }
+  ]
+}
+```
+
 ---
 
 ## Request Examples
 
+### Windows PowerShell (important)
+
+In Windows PowerShell, `curl` is usually an alias of `Invoke-WebRequest`.
+If you run Linux-style flags (`-X`, `-H`, `-d`) directly, you may get errors like:
+`A parameter cannot be found that matches parameter name 'X'`.
+
+Use one of these options:
+
+#### Option 1: `curl.exe` (real curl)
+
+```powershell
+curl.exe -X POST "https://prontoweb-api.ngrok.app/v1/parts/availability/resolve" -H "Content-Type: application/json" -H "x-api-key: your_api_key_here" -d "{\"storeId\":5,\"locationId\":4,\"products\":[{\"brand\":\"BRIGGS & STRATTON\",\"mpn\":\"492932S\"}]}"
+```
+
+#### Option 2: Native PowerShell (`Invoke-RestMethod`)
+
+```powershell
+$headers = @{
+  "Content-Type" = "application/json"
+  "x-api-key"    = "your_api_key_here"
+}
+
+$body = @{
+  storeId    = 5
+  locationId = 4
+  products   = @(
+    @{
+      brand = "BRIGGS & STRATTON"
+      mpn   = "492932S"
+    }
+  )
+} | ConvertTo-Json -Depth 5
+
+Invoke-RestMethod -Method POST `
+  -Uri "https://prontoweb-api.ngrok.app/v1/parts/availability/resolve" `
+  -Headers $headers `
+  -Body $body
+```
+
 ### Single Product by SKU
 
 ```bash
-curl -X POST http://localhost:3001/v1/parts/availability/resolve \
+curl -X POST https://prontoweb-api.ngrok.app/v1/parts/availability/resolve \
   -H "Content-Type: application/json" \
   -H "x-api-key: your_api_key_here" \
   -d '{
@@ -128,7 +195,7 @@ curl -X POST https://prontoweb-api.ngrok.app/v1/parts/availability/resolve \
 ### Single Product by MPN
 
 ```bash
-curl -X POST http://localhost:3001/v1/parts/availability/resolve \
+curl -X POST https://prontoweb-api.ngrok.app/v1/parts/availability/resolve \
   -H "Content-Type: application/json" \
   -H "x-api-key: your_api_key_here" \
   -d '{
@@ -146,7 +213,7 @@ curl -X POST http://localhost:3001/v1/parts/availability/resolve \
 ### Multiple Products (Batch)
 
 ```bash
-curl -X POST http://localhost:3001/v1/parts/availability/resolve \
+curl -X POST https://prontoweb-api.ngrok.app/v1/parts/availability/resolve \
   -H "Content-Type: application/json" \
   -H "x-api-key: your_api_key_here" \
   -d '{
@@ -341,7 +408,7 @@ const axios = require('axios');
 async function checkPartsAvailability(products) {
   try {
     const response = await axios.post(
-      'http://localhost:3001/v1/parts/availability/resolve',
+      'https://prontoweb-api.ngrok.app/v1/parts/availability/resolve',
       {
         storeId: 5,
         locationId: 4,
@@ -385,7 +452,7 @@ checkPartsAvailability(products)
 
 ```javascript
 async function checkAvailability(brand, sku) {
-  const response = await fetch('http://localhost:3001/v1/parts/availability/resolve', {
+  const response = await fetch('https://prontoweb-api.ngrok.app/v1/parts/availability/resolve', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -416,7 +483,7 @@ checkAvailability('BRIGGS & STRATTON', 'BRIGGS 492932S')
 ```php
 <?php
 function checkPartsAvailability($products) {
-    $url = 'http://localhost:3001/v1/parts/availability/resolve';
+  $url = 'https://prontoweb-api.ngrok.app/v1/parts/availability/resolve';
     
     $data = [
         'storeId' => 5,
@@ -466,7 +533,7 @@ import requests
 import json
 
 def check_parts_availability(products):
-    url = 'http://localhost:3001/v1/parts/availability/resolve'
+  url = 'https://prontoweb-api.ngrok.app/v1/parts/availability/resolve'
     
     headers = {
         'Content-Type': 'application/json',

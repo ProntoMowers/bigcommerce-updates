@@ -24,8 +24,9 @@ const SCRIPT_NAME = 'updateCustomFieldsInventoryTop';
 const logger = createLogger(SCRIPT_NAME);
 
 // Configuración de la API de Parts Availability
-const PARTS_API_URL = process.env.PARTS_API_URL || 'http://10.1.10.21:3001/v1/parts/availability/resolve';
-const PARTS_API_KEY = process.env.PARTS_API_KEY || process.env.PARTS_AVAILABILITY_API_KEY || '';
+const API_BASE_URL = process.env.API_URL || 'https://prontoweb-api.ngrok.app';
+const PARTS_API_URL = process.env.PARTS_API_URL || `${API_BASE_URL}/v1/parts/availability/resolve`;
+const PARTS_API_KEY = process.env.PARTS_AVAILABILITY_API_KEY || process.env.PARTS_API_KEY || '';
 const LOCATION_ID = 4; // Siempre usar locationId = 4
 const BATCH_SIZE = 50; // Máximo de productos por request
 
@@ -526,6 +527,7 @@ async function main() {
   logger.info('Script: updateCustomFieldsInventoryTop.js');
   logger.info(`Fecha: ${new Date().toISOString()}`);
   logger.info(`Parámetros: STORE_CODE=${storeCode}, PRODUCT_ID=${productId || 'N/A'}`);
+  logger.info(`Parts API URL: ${PARTS_API_URL}`);
   logger.info('===============================================');
   
   try {
