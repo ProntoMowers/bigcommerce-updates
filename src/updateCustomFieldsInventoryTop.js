@@ -32,6 +32,8 @@ const BATCH_SIZE = 50; // Máximo de productos por request
 const BC_MAX_RETRIES = parseInt(process.env.BC_MAX_RETRIES || '5', 10);
 const MONGO_MAX_RETRIES = parseInt(process.env.MONGO_MAX_RETRIES || '5', 10);
 const RETRY_BASE_DELAY_MS = parseInt(process.env.RETRY_BASE_DELAY_MS || '500', 10);
+const VERBOSE_LOGS = process.env.VERBOSE_LOGS === '1';
+const LOG_MEMORY = process.env.LOG_MEMORY === '1';
 
 // MongoDB - será necesario instalar mongodb
 let mongoClient;
@@ -58,6 +60,12 @@ function sleep(ms) {
 
 function getBackoffMs(attempt) {
   return Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), 10000);
+}
+
+function verboseInfo(message) {
+  if (VERBOSE_LOGS) {
+    logger.info(message);
+  }
 }
 
 function isRetryableNetworkError(error) {
@@ -306,6 +314,7 @@ async function* getMongoProductsBatches(storeId, productId = null, batchSize = B
 }
 
 function logMemoryUsage(context) {
+  if (!LOG_MEMORY) return;
   const mem = process.memoryUsage();
   const rssMb = (mem.rss / 1024 / 1024).toFixed(1);
   const heapUsedMb = (mem.heapUsed / 1024 / 1024).toFixed(1);
@@ -416,7 +425,7 @@ async function createCustomField(client, productId, name, value) {
       { method: 'POST', url: `/catalog/products/${productId}/custom-fields`, data: { name, value } },
       `createCustomField product=${productId} field=${name}`
     );
-    logger.info(`Custom field ${name} creado para producto ${productId}`);
+    verboseInfo(`Custom field ${name} creado para producto ${productId}`);
     return true;
   } catch (error) {
     logger.error(`Error creando custom field ${name} para producto ${productId}: ${error.message}`);
@@ -432,7 +441,7 @@ async function updateCustomField(client, productId, fieldId, value) {
       { method: 'PUT', url: `/catalog/products/${productId}/custom-fields/${fieldId}`, data: { value } },
       `updateCustomField product=${productId} fieldId=${fieldId}`
     );
-    logger.info(`Custom field ID ${fieldId} actualizado para producto ${productId}`);
+    verboseInfo(`Custom field ID ${fieldId} actualizado para producto ${productId}`);
     return true;
   } catch (error) {
     logger.error(`Error actualizando custom field ${fieldId} para producto ${productId}: ${error.message}`);
@@ -448,7 +457,7 @@ async function deleteCustomField(client, productId, fieldId) {
       { method: 'DELETE', url: `/catalog/products/${productId}/custom-fields/${fieldId}` },
       `deleteCustomField product=${productId} fieldId=${fieldId}`
     );
-    logger.info(`Custom field ID ${fieldId} eliminado para producto ${productId}`);
+    verboseInfo(`Custom field ID ${fieldId} eliminado para producto ${productId}`);
     return true;
   } catch (error) {
     logger.error(`Error eliminando custom field ${fieldId} para producto ${productId}: ${error.message}`);
@@ -483,12 +492,14 @@ async function getPartsAvailability(storeId, products) {
     products: productsPayload,
   };
 
-  logger.info(
+  verboseInfo(
     `Parts API payload -> storeId=${payload.storeId}, locationId=${payload.locationId}, products=${payload.products.length}`
   );
-  productsPayload.slice(0, 3).forEach((p, idx) => {
-    logger.info(`Parts API item[${idx}] brand="${p.brand}" sku="${p.sku || ''}" mpn="${p.mpn || ''}"`);
-  });
+  if (VERBOSE_LOGS) {
+    productsPayload.slice(0, 3).forEach((p, idx) => {
+      logger.info(`Parts API item[${idx}] brand="${p.brand}" sku="${p.sku || ''}" mpn="${p.mpn || ''}"`);
+    });
+  }
   
   try {
     const response = await axios.post(PARTS_API_URL, payload, {
@@ -531,7 +542,7 @@ async function calculateCustomFieldValues(product, partsData, storeId) {
   
   // 1. __badge - basado en is_free_shipping
   const hasFreeShipping = product.is_free_shipping === true;
-  logger.info(
+  verboseInfo(
     `Producto ${product.id} (${product.sku}): is_free_shipping=${String(product.is_free_shipping)} -> ${hasFreeShipping ? '__badge=Free Shipping' : '__badge=(sin valor)'}`
   );
   if (hasFreeShipping) {
@@ -546,13 +557,13 @@ async function calculateCustomFieldValues(product, partsData, storeId) {
     values.__inv = 'Y';
     values.__topseller = 'Y';
     stats.productsSpecial++;
-    logger.info(`Producto ${product.id} (${product.sku}) es especial - forzando __inv y __topseller`);
+    verboseInfo(`Producto ${product.id} (${product.sku}) es especial - forzando __inv y __topseller`);
     return values;
   }
   
   // 3. Obtener datos de IDEAL desde Parts Availability
   if (!partsData) {
-    logger.warn(`No hay datos de Parts Availability para producto ${product.id} (${product.sku})`);
+    verboseInfo(`No hay datos de Parts Availability para producto ${product.id} (${product.sku})`);
     return values;
   }
   
@@ -572,7 +583,7 @@ async function calculateCustomFieldValues(product, partsData, storeId) {
     if (abc && (abc.clasif_completo === 'A' || abc.clasif_completo === 'B')) {
       values.__topseller = 'Y';
       stats.productsAB++;
-      logger.info(`Producto ${product.id} (${product.sku}) clasificación: ${abc.clasif_completo}`);
+      verboseInfo(`Producto ${product.id} (${product.sku}) clasificación: ${abc.clasif_completo}`);
     }
   }
   
@@ -595,7 +606,7 @@ async function syncCustomFields(client, product, desiredValues) {
           const success = await updateCustomField(client, product.id, existingField.id, desiredValue);
           if (success) stats.customFieldsUpdated[fieldName]++;
         } else {
-          logger.info(`Custom field ${fieldName} ya tiene el valor correcto para producto ${product.id}`);
+          verboseInfo(`Custom field ${fieldName} ya tiene el valor correcto para producto ${product.id}`);
         }
       } else {
         // No existe - crear
@@ -678,6 +689,7 @@ async function processStore(storeId, productId = null) {
     });
 
     // 6. Procesar cada producto del lote
+    let skippedNoPartsInBatch = 0;
     for (const product of batchForParts) {
       try {
         const lookupKey = buildPartsLookupKey({ mpn: product.mpn, sku: product.sku });
@@ -685,7 +697,8 @@ async function processStore(storeId, productId = null) {
 
         // Fail-safe: si no hay data de Parts para el producto, no hacer cambios
         if (!partsData) {
-          logger.warn(
+          skippedNoPartsInBatch++;
+          verboseInfo(
             `Producto ${product.id} (${product.sku || product.mpn || 'sin-sku-mpn'}): sin data de Parts Availability, se omite sin cambios.`
           );
           continue;
@@ -700,6 +713,12 @@ async function processStore(storeId, productId = null) {
         logger.error(`Error procesando producto ${product.id}: ${error.message}`);
         stats.errors++;
       }
+    }
+
+    if (skippedNoPartsInBatch > 0) {
+      logger.info(
+        `Tienda ${storeId} - lote ${batchNumber}: omitidos_sin_parts=${skippedNoPartsInBatch}`
+      );
     }
 
     if (batchNumber % 25 === 0) {
