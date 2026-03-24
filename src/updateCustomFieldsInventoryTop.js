@@ -29,6 +29,9 @@ const PARTS_API_URL = process.env.PARTS_API_URL || `${API_BASE_URL}/v1/parts/ava
 const PARTS_API_KEY = process.env.PARTS_AVAILABILITY_API_KEY || process.env.PARTS_API_KEY || '';
 const LOCATION_ID = 4; // Siempre usar locationId = 4
 const BATCH_SIZE = 50; // Máximo de productos por request
+const BC_MAX_RETRIES = parseInt(process.env.BC_MAX_RETRIES || '5', 10);
+const MONGO_MAX_RETRIES = parseInt(process.env.MONGO_MAX_RETRIES || '5', 10);
+const RETRY_BASE_DELAY_MS = parseInt(process.env.RETRY_BASE_DELAY_MS || '500', 10);
 
 // MongoDB - será necesario instalar mongodb
 let mongoClient;
@@ -49,6 +52,31 @@ const stats = {
   endTime: null,
 };
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getBackoffMs(attempt) {
+  return Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), 10000);
+}
+
+function isRetryableNetworkError(error) {
+  const code = error?.code;
+  return ['ECONNRESET', 'ETIMEDOUT', 'ESOCKETTIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND'].includes(code);
+}
+
+function isRetryableHttpStatus(status) {
+  return [408, 409, 429, 500, 502, 503, 504].includes(status);
+}
+
+function isRetryableMongoError(error) {
+  if (!error) return false;
+  if (isRetryableNetworkError(error)) return true;
+
+  const name = error.name || '';
+  return name === 'MongoNetworkError' || name === 'MongoServerSelectionError' || name === 'MongoNetworkTimeoutError';
+}
+
 // ============================================
 // MONGODB CONNECTION
 // ============================================
@@ -56,8 +84,15 @@ async function connectMongoDB() {
   const { MongoClient } = require('mongodb');
   const mongoUri = process.env.MONGO_URI || 'mongodb://localhost:27017';
   const mongoDbName = process.env.MONGO_DB || 'Prontoweb';
-  
-  mongoClient = new MongoClient(mongoUri);
+
+  mongoClient = new MongoClient(mongoUri, {
+    maxPoolSize: 20,
+    minPoolSize: 2,
+    connectTimeoutMS: 15000,
+    socketTimeoutMS: 60000,
+    serverSelectionTimeoutMS: 15000,
+    retryReads: true,
+  });
   await mongoClient.connect();
   mongoDb = mongoClient.db(mongoDbName);
   logger.info(`Conectado a MongoDB: ${mongoDbName}`);
@@ -155,6 +190,7 @@ function getMongoProductsCursor(storeId, productId = null) {
 
   return collection.find(query, {
     projection: {
+      _id: 1,
       ID: 1,
       product_id: 1,
       BRAND: 1,
@@ -164,6 +200,7 @@ function getMongoProductsCursor(storeId, productId = null) {
       MPN: 1,
       mpn: 1,
     },
+    sort: { _id: 1 },
     batchSize: BATCH_SIZE,
   });
 }
@@ -174,6 +211,7 @@ function mapMongoProduct(p) {
   if (Number.isNaN(id)) return null;
 
   return {
+    mongoId: p._id,
     id,
     brand: p.BRAND || p.brand || '',
     sku: p.SKU || p.sku || '',
@@ -182,17 +220,83 @@ function mapMongoProduct(p) {
 }
 
 async function* getMongoProductsBatches(storeId, productId = null, batchSize = BATCH_SIZE) {
-  const cursor = getMongoProductsCursor(storeId, productId);
+  let cursor = getMongoProductsCursor(storeId, productId);
+  let retries = 0;
+  let lastMongoId = null;
   let batch = [];
 
-  for await (const rawDoc of cursor) {
-    const mapped = mapMongoProduct(rawDoc);
-    if (!mapped) continue;
+  while (true) {
+    try {
+      for await (const rawDoc of cursor) {
+        const mapped = mapMongoProduct(rawDoc);
+        lastMongoId = rawDoc?._id || lastMongoId;
+        if (!mapped) continue;
 
-    batch.push(mapped);
-    if (batch.length >= batchSize) {
-      yield batch;
-      batch = [];
+        batch.push(mapped);
+        if (batch.length >= batchSize) {
+          yield batch;
+          batch = [];
+        }
+      }
+
+      break;
+    } catch (error) {
+      if (!isRetryableMongoError(error) || retries >= MONGO_MAX_RETRIES) {
+        throw error;
+      }
+
+      retries++;
+      const waitMs = getBackoffMs(retries);
+      logger.warn(
+        `Mongo cursor retry ${retries}/${MONGO_MAX_RETRIES} para tienda ${storeId} en ${waitMs}ms: ${error.message}`
+      );
+      await sleep(waitMs);
+
+      const collectionName = process.env.MONGO_PRODUCTS_COLLECTION || 'Products';
+      const collection = mongoDb.collection(collectionName);
+      const storeIdNum = parseInt(storeId, 10);
+      const query = {
+        $or: [
+          { STOREID: storeIdNum },
+          { STOREID: String(storeIdNum) },
+          { store_id: storeIdNum },
+          { store_id: String(storeIdNum) },
+        ],
+      };
+
+      if (productId) {
+        const productIdNum = parseInt(productId, 10);
+        query.$and = [
+          {
+            $or: [
+              { ID: productIdNum },
+              { ID: String(productIdNum) },
+              { product_id: productIdNum },
+              { product_id: String(productIdNum) },
+            ],
+          },
+        ];
+      }
+
+      if (lastMongoId) {
+        query._id = { $gt: lastMongoId };
+      }
+
+      cursor = collection.find(query, {
+        projection: {
+          _id: 1,
+          ID: 1,
+          product_id: 1,
+          BRAND: 1,
+          brand: 1,
+          SKU: 1,
+          sku: 1,
+          MPN: 1,
+          mpn: 1,
+        },
+        sort: { _id: 1 },
+        batchSize,
+      });
     }
   }
 
@@ -207,6 +311,28 @@ function logMemoryUsage(context) {
   const heapUsedMb = (mem.heapUsed / 1024 / 1024).toFixed(1);
   const heapTotalMb = (mem.heapTotal / 1024 / 1024).toFixed(1);
   logger.info(`[MEM] ${context} rss=${rssMb}MB heapUsed=${heapUsedMb}MB heapTotal=${heapTotalMb}MB`);
+}
+
+async function bcRequest(client, config, label) {
+  for (let attempt = 1; attempt <= BC_MAX_RETRIES + 1; attempt++) {
+    try {
+      return await client.request(config);
+    } catch (error) {
+      const status = error.response?.status;
+      const retryable = isRetryableNetworkError(error) || isRetryableHttpStatus(status);
+      const hasNext = attempt <= BC_MAX_RETRIES;
+
+      if (!retryable || !hasNext) {
+        throw error;
+      }
+
+      const waitMs = getBackoffMs(attempt);
+      logger.warn(
+        `BigCommerce retry ${attempt}/${BC_MAX_RETRIES} (${label}) en ${waitMs}ms status=${status || 'N/A'} err=${error.message}`
+      );
+      await sleep(waitMs);
+    }
+  }
 }
 
 // ============================================
@@ -226,7 +352,11 @@ function createBCClient(storeHash, accessToken) {
 
 async function getProductDetails(client, productId) {
   try {
-    const response = await client.get(`/catalog/products/${productId}?include=custom_fields`);
+    const response = await bcRequest(
+      client,
+      { method: 'GET', url: `/catalog/products/${productId}?include=custom_fields` },
+      `getProductDetails product=${productId}`
+    );
     return response.data.data;
   } catch (error) {
     logger.error(`Error obteniendo producto ${productId}: ${error.message}`);
@@ -244,7 +374,11 @@ async function getProductsDetailsBatch(client, productIds) {
     const idsParam = batch.join(',');
     
     try {
-      const response = await client.get(`/catalog/products?id:in=${idsParam}&include=custom_fields&limit=50`);
+      const response = await bcRequest(
+        client,
+        { method: 'GET', url: `/catalog/products?id:in=${idsParam}&include=custom_fields&limit=50` },
+        `getProductsDetailsBatch ids=${idsParam}`
+      );
       if (response.data.data) {
         products.push(...response.data.data);
       }
@@ -263,7 +397,11 @@ async function getProductsDetailsBatch(client, productIds) {
 
 async function getCustomFields(client, productId) {
   try {
-    const response = await client.get(`/catalog/products/${productId}/custom-fields`);
+    const response = await bcRequest(
+      client,
+      { method: 'GET', url: `/catalog/products/${productId}/custom-fields` },
+      `getCustomFields product=${productId}`
+    );
     return response.data.data || [];
   } catch (error) {
     logger.error(`Error obteniendo custom fields del producto ${productId}: ${error.message}`);
@@ -273,7 +411,11 @@ async function getCustomFields(client, productId) {
 
 async function createCustomField(client, productId, name, value) {
   try {
-    await client.post(`/catalog/products/${productId}/custom-fields`, { name, value });
+    await bcRequest(
+      client,
+      { method: 'POST', url: `/catalog/products/${productId}/custom-fields`, data: { name, value } },
+      `createCustomField product=${productId} field=${name}`
+    );
     logger.info(`Custom field ${name} creado para producto ${productId}`);
     return true;
   } catch (error) {
@@ -285,7 +427,11 @@ async function createCustomField(client, productId, name, value) {
 
 async function updateCustomField(client, productId, fieldId, value) {
   try {
-    await client.put(`/catalog/products/${productId}/custom-fields/${fieldId}`, { value });
+    await bcRequest(
+      client,
+      { method: 'PUT', url: `/catalog/products/${productId}/custom-fields/${fieldId}`, data: { value } },
+      `updateCustomField product=${productId} fieldId=${fieldId}`
+    );
     logger.info(`Custom field ID ${fieldId} actualizado para producto ${productId}`);
     return true;
   } catch (error) {
@@ -297,7 +443,11 @@ async function updateCustomField(client, productId, fieldId, value) {
 
 async function deleteCustomField(client, productId, fieldId) {
   try {
-    await client.delete(`/catalog/products/${productId}/custom-fields/${fieldId}`);
+    await bcRequest(
+      client,
+      { method: 'DELETE', url: `/catalog/products/${productId}/custom-fields/${fieldId}` },
+      `deleteCustomField product=${productId} fieldId=${fieldId}`
+    );
     logger.info(`Custom field ID ${fieldId} eliminado para producto ${productId}`);
     return true;
   } catch (error) {
@@ -467,6 +617,7 @@ async function syncCustomFields(client, product, desiredValues) {
 // MAIN PROCESS
 // ============================================
 async function processStore(storeId, productId = null) {
+  const storeStart = Date.now();
   logger.info(`===== Procesando tienda ${storeId} =====`);
   
   // 1. Obtener credenciales de la tienda
@@ -476,7 +627,7 @@ async function processStore(storeId, productId = null) {
     return;
   }
   
-  logger.info(`Tienda: ${store.name} (${store.STOREHASH})`);
+  logger.info(`Tienda ${storeId}: ${store.name} (${store.STOREHASH})`);
   
   // 2. Crear cliente de BigCommerce
   const bcClient = createBCClient(store.STOREHASH, store.ACCESSTOKEN);
@@ -489,14 +640,14 @@ async function processStore(storeId, productId = null) {
     totalMongoProducts += mongoBatch.length;
     stats.totalProducts += mongoBatch.length;
 
-    logger.info(`Procesando lote ${batchNumber}: ${mongoBatch.length} producto(s) desde MongoDB`);
+    logger.info(`Tienda ${storeId} - lote ${batchNumber}: ${mongoBatch.length} producto(s) desde MongoDB`);
 
     const productIds = mongoBatch.map((p) => p.id);
     const mongoProductsById = new Map(mongoBatch.map((p) => [p.id, p]));
 
     // 4. Obtener detalles de productos desde BigCommerce para este lote
     const products = await getProductsDetailsBatch(bcClient, productIds);
-    logger.info(`Detalles BigCommerce obtenidos en lote ${batchNumber}: ${products.length}`);
+    logger.info(`Tienda ${storeId} - lote ${batchNumber}: detalles BigCommerce obtenidos=${products.length}`);
 
     if (!products.length) {
       logMemoryUsage(`store=${storeId} lote=${batchNumber} (sin detalles BC)`);
@@ -551,6 +702,12 @@ async function processStore(storeId, productId = null) {
       }
     }
 
+    if (batchNumber % 25 === 0) {
+      logger.info(
+        `Tienda ${storeId}: progreso parcial -> lotes=${batchNumber}, productos_procesados=${totalMongoProducts}, errores=${stats.errors}`
+      );
+    }
+
     logMemoryUsage(`store=${storeId} lote=${batchNumber}`);
   }
 
@@ -559,7 +716,9 @@ async function processStore(storeId, productId = null) {
     return;
   }
 
-  logger.info(`Total de productos procesados desde MongoDB en tienda ${storeId}: ${totalMongoProducts}`);
+  const storeDurationSec = ((Date.now() - storeStart) / 1000).toFixed(2);
+  logger.info(`Tienda ${storeId}: total de productos procesados desde MongoDB=${totalMongoProducts}`);
+  logger.info(`Tienda ${storeId}: tiempo total=${storeDurationSec}s`);
   
   logger.info(`===== Tienda ${storeId} completada =====`);
 }
@@ -624,8 +783,11 @@ async function main() {
     }
     
     // Procesar cada tienda
-    for (const storeId of storesToProcess) {
+    for (let index = 0; index < storesToProcess.length; index++) {
+      const storeId = storesToProcess[index];
+      logger.info(`>>> Inicio tienda ${storeId} (${index + 1}/${storesToProcess.length})`);
       await processStore(storeId, productId);
+      logger.info(`<<< Fin tienda ${storeId} (${index + 1}/${storesToProcess.length})`);
     }
     
     // Resumen final
@@ -659,6 +821,7 @@ async function main() {
     logger.info('');
     logger.info(`Errores: ${stats.errors}`);
     logger.info(`Duración total: ${duration.toFixed(2)} segundos`);
+    logger.info(`Resumen ejecución: productos procesados=${stats.totalProducts}, tiempo=${duration.toFixed(2)}s`);
     logger.info('===============================================');
     
   } catch (error) {
