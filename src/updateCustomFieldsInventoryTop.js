@@ -112,7 +112,21 @@ async function isSpecialProduct(brand, sku) {
 // ============================================
 // MONGODB QUERIES
 // ============================================
-async function getProductsFromMongo(storeId, productId = null) {
+function normalizeLookupValue(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function buildPartsLookupKey(item) {
+  const mpn = normalizeLookupValue(item?.mpn);
+  if (mpn) return `mpn:${mpn}`;
+
+  const sku = normalizeLookupValue(item?.sku);
+  if (sku) return `sku:${sku}`;
+
+  return '';
+}
+
+function getMongoProductsCursor(storeId, productId = null) {
   const collectionName = process.env.MONGO_PRODUCTS_COLLECTION || 'Products';
   const collection = mongoDb.collection(collectionName);
   const storeIdNum = parseInt(storeId, 10);
@@ -139,22 +153,60 @@ async function getProductsFromMongo(storeId, productId = null) {
     ];
   }
 
-  const products = await collection.find(query).toArray();
-  logger.info(`MongoDB: ${products.length} productos encontrados para tienda ${storeId}`);
-  return products
-    .map((p) => {
-      const idRaw = p.ID ?? p.product_id;
-      const id = parseInt(idRaw, 10);
-      if (Number.isNaN(id)) return null;
+  return collection.find(query, {
+    projection: {
+      ID: 1,
+      product_id: 1,
+      BRAND: 1,
+      brand: 1,
+      SKU: 1,
+      sku: 1,
+      MPN: 1,
+      mpn: 1,
+    },
+    batchSize: BATCH_SIZE,
+  });
+}
 
-      return {
-        id,
-        brand: p.BRAND || p.brand || '',
-        sku: p.SKU || p.sku || '',
-        mpn: p.MPN || p.mpn || '',
-      };
-    })
-    .filter((p) => p !== null);
+function mapMongoProduct(p) {
+  const idRaw = p.ID ?? p.product_id;
+  const id = parseInt(idRaw, 10);
+  if (Number.isNaN(id)) return null;
+
+  return {
+    id,
+    brand: p.BRAND || p.brand || '',
+    sku: p.SKU || p.sku || '',
+    mpn: p.MPN || p.mpn || '',
+  };
+}
+
+async function* getMongoProductsBatches(storeId, productId = null, batchSize = BATCH_SIZE) {
+  const cursor = getMongoProductsCursor(storeId, productId);
+  let batch = [];
+
+  for await (const rawDoc of cursor) {
+    const mapped = mapMongoProduct(rawDoc);
+    if (!mapped) continue;
+
+    batch.push(mapped);
+    if (batch.length >= batchSize) {
+      yield batch;
+      batch = [];
+    }
+  }
+
+  if (batch.length) {
+    yield batch;
+  }
+}
+
+function logMemoryUsage(context) {
+  const mem = process.memoryUsage();
+  const rssMb = (mem.rss / 1024 / 1024).toFixed(1);
+  const heapUsedMb = (mem.heapUsed / 1024 / 1024).toFixed(1);
+  const heapTotalMb = (mem.heapTotal / 1024 / 1024).toFixed(1);
+  logger.info(`[MEM] ${context} rss=${rssMb}MB heapUsed=${heapUsedMb}MB heapTotal=${heapTotalMb}MB`);
 }
 
 // ============================================
@@ -428,32 +480,31 @@ async function processStore(storeId, productId = null) {
   
   // 2. Crear cliente de BigCommerce
   const bcClient = createBCClient(store.STOREHASH, store.ACCESSTOKEN);
-  
-  // 3. Obtener productos desde MongoDB
-  const mongoProducts = await getProductsFromMongo(storeId, productId);
-  if (mongoProducts.length === 0) {
-    logger.warn(`No hay productos en MongoDB para tienda ${storeId}`);
-    return;
-  }
 
-  const productIds = mongoProducts.map((p) => p.id);
-  const mongoProductsById = new Map(mongoProducts.map((p) => [p.id, p]));
-  
-  stats.totalProducts += productIds.length;
-  logger.info(`Total de productos a procesar: ${productIds.length}`);
-  
-  // 4. Obtener detalles de productos desde BigCommerce
-  logger.info('Obteniendo detalles de productos desde BigCommerce...');
-  const products = await getProductsDetailsBatch(bcClient, productIds);
-  logger.info(`Detalles obtenidos: ${products.length} productos`);
-  
-  // 5. Procesar en lotes de 50 para Parts Availability API
-  for (let i = 0; i < products.length; i += BATCH_SIZE) {
-    const batch = products.slice(i, i + BATCH_SIZE);
-    logger.info(`Procesando lote ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(products.length / BATCH_SIZE)}`);
-    
-    // 6. Consultar Parts Availability API
-    const batchForParts = batch.map((product) => {
+  // 3. Obtener y procesar productos desde MongoDB por lotes (evita OOM)
+  let totalMongoProducts = 0;
+  let batchNumber = 0;
+  for await (const mongoBatch of getMongoProductsBatches(storeId, productId, BATCH_SIZE)) {
+    batchNumber++;
+    totalMongoProducts += mongoBatch.length;
+    stats.totalProducts += mongoBatch.length;
+
+    logger.info(`Procesando lote ${batchNumber}: ${mongoBatch.length} producto(s) desde MongoDB`);
+
+    const productIds = mongoBatch.map((p) => p.id);
+    const mongoProductsById = new Map(mongoBatch.map((p) => [p.id, p]));
+
+    // 4. Obtener detalles de productos desde BigCommerce para este lote
+    const products = await getProductsDetailsBatch(bcClient, productIds);
+    logger.info(`Detalles BigCommerce obtenidos en lote ${batchNumber}: ${products.length}`);
+
+    if (!products.length) {
+      logMemoryUsage(`store=${storeId} lote=${batchNumber} (sin detalles BC)`);
+      continue;
+    }
+
+    // 5. Consultar Parts Availability API
+    const batchForParts = products.map((product) => {
       const mongoProduct = mongoProductsById.get(product.id);
       return {
         ...product,
@@ -464,32 +515,51 @@ async function processStore(storeId, productId = null) {
     });
 
     const partsResults = await getPartsAvailability(storeId, batchForParts);
-    
-    // Crear un mapa para búsqueda rápida
+
+    // Crear mapa por llave normalizada (mpn/sku)
     const partsMap = new Map();
-    partsResults.forEach(result => {
-      const key = result.input?.mpn || result.input?.sku;
+    partsResults.forEach((result) => {
+      const key = buildPartsLookupKey({
+        mpn: result?.input?.mpn,
+        sku: result?.input?.sku,
+      });
       if (key) partsMap.set(key, result);
     });
-    
-    // 7. Procesar cada producto del lote
-    for (const product of batch) {
+
+    // 6. Procesar cada producto del lote
+    for (const product of batchForParts) {
       try {
-        const lookupKey = product.mpn || product.sku;
-        const partsData = partsMap.get(lookupKey);
-        
+        const lookupKey = buildPartsLookupKey({ mpn: product.mpn, sku: product.sku });
+        const partsData = lookupKey ? partsMap.get(lookupKey) : null;
+
+        // Fail-safe: si no hay data de Parts para el producto, no hacer cambios
+        if (!partsData) {
+          logger.warn(
+            `Producto ${product.id} (${product.sku || product.mpn || 'sin-sku-mpn'}): sin data de Parts Availability, se omite sin cambios.`
+          );
+          continue;
+        }
+
         // 8. Calcular valores deseados para custom fields
         const desiredValues = await calculateCustomFieldValues(product, partsData, storeId);
-        
+
         // 9. Sincronizar custom fields
         await syncCustomFields(bcClient, product, desiredValues);
-        
       } catch (error) {
         logger.error(`Error procesando producto ${product.id}: ${error.message}`);
         stats.errors++;
       }
     }
+
+    logMemoryUsage(`store=${storeId} lote=${batchNumber}`);
   }
+
+  if (totalMongoProducts === 0) {
+    logger.warn(`No hay productos en MongoDB para tienda ${storeId}`);
+    return;
+  }
+
+  logger.info(`Total de productos procesados desde MongoDB en tienda ${storeId}: ${totalMongoProducts}`);
   
   logger.info(`===== Tienda ${storeId} completada =====`);
 }
