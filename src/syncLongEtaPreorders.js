@@ -61,6 +61,7 @@ const MONGO_PRODUCTS_COLLECTION = process.env.MONGO_PRODUCTS_COLLECTION || 'Prod
 
 const stats = {
   partsFromIdeal: 0,
+  partsExcludedNoListar: 0,
   reverseMatchedParts: 0,
   preorderProductsUpdatedBC: 0,
   preorderProductsUpdatedMongo: 0,
@@ -745,6 +746,23 @@ async function getAllLongEtaRows() {
   return rows;
 }
 
+async function getNoListarPartKeys() {
+  const pool = getMySqlConnection();
+  const [rows] = await pool.execute(
+    `SELECT DISTINCT mfr, partnumber
+     FROM no_listar_listprice
+     WHERE mfr IS NOT NULL AND TRIM(mfr) <> ''
+       AND partnumber IS NOT NULL AND TRIM(partnumber) <> ''`
+  );
+
+  const keys = new Set();
+  for (const row of rows) {
+    const key = toPartKey(row.mfr, row.partnumber);
+    if (key !== '|||') keys.add(key);
+  }
+  return keys;
+}
+
 async function generateMongoPreorderWithoutLongEtaCsv(mongoCollection) {
   const longEtaRows = await getAllLongEtaRows();
   const longEtaSet = new Set(
@@ -907,6 +925,8 @@ async function main() {
   try {
     // A: IDEAL -> lista única de partes por antigüedad
     const activePartsRaw = await getAgedBackorderParts(DAYS_THRESHOLD);
+    const noListarPartKeys = await getNoListarPartKeys();
+
     let activeParts =
       ONLY_MFRID && ONLY_PARTNUMBER
         ? activePartsRaw.filter(
@@ -914,10 +934,21 @@ async function main() {
           )
         : activePartsRaw;
 
+    const beforeNoListarFilter = activeParts.length;
+    activeParts = activeParts.filter((p) => !noListarPartKeys.has(toPartKey(p.mfrid, p.partnumber)));
+    stats.partsExcludedNoListar = beforeNoListarFilter - activeParts.length;
+
     stats.partsFromIdeal = activeParts.length;
     logger.info(`Partes activas desde IDEAL: ${activeParts.length}`);
+    logger.info(`Partes excluidas por no_listar_listprice: ${stats.partsExcludedNoListar}`);
     if (ONLY_MFRID && ONLY_PARTNUMBER) {
       logger.info(`Filtro por parte habilitado: ${ONLY_MFRID}/${ONLY_PARTNUMBER}`);
+
+      if (noListarPartKeys.has(toPartKey(ONLY_MFRID, ONLY_PARTNUMBER))) {
+        logger.warn(
+          `La parte ${ONLY_MFRID}/${ONLY_PARTNUMBER} está en no_listar_listprice y se excluye de la corrida Long ETA.`
+        );
+      }
 
       if (!activeParts.length) {
         const diag = await getSinglePartDiagnostics(ONLY_MFRID, ONLY_PARTNUMBER, DAYS_THRESHOLD);
@@ -941,6 +972,7 @@ async function main() {
     }
 
     const activePartKeys = new Set(activeParts.map((p) => toPartKey(p.mfrid, p.partnumber)));
+    const protectedPartKeys = new Set([...activePartKeys, ...noListarPartKeys]);
 
     // A.2 + A.3: mantener long_eta_products (system) y expected date
     for (const part of activeParts) {
@@ -968,7 +1000,7 @@ async function main() {
     if (ONLY_MFRID && ONLY_PARTNUMBER) {
       logger.info('Modo single-part: se omite archivado masivo (A.4).');
     } else {
-      const archivedParts = await archiveSystemRowsMissingInActiveParts(activePartKeys);
+      const archivedParts = await archiveSystemRowsMissingInActiveParts(protectedPartKeys);
       logger.info(`Partes archivadas (system no activas): ${archivedParts.length}`);
 
       if (archivedParts.length) {
@@ -994,6 +1026,7 @@ async function main() {
     const elapsedMin = (elapsedMs / 60000).toFixed(2);
     logger.info('===== RESUMEN =====');
     logger.info(`partsFromIdeal=${stats.partsFromIdeal}`);
+    logger.info(`partsExcludedNoListar=${stats.partsExcludedNoListar}`);
     logger.info(`reverseMatchedParts=${stats.reverseMatchedParts}`);
     logger.info(`preorderProductsUpdatedBC=${stats.preorderProductsUpdatedBC}`);
     logger.info(`preorderProductsUpdatedMongo=${stats.preorderProductsUpdatedMongo}`);
